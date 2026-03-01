@@ -22,10 +22,17 @@ fi
 dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
 dir_name=$(basename "$dir")
 
-# --- git branch ---
+# --- git branch + remote URL ---
 branch=""
+github_url=""
 if [ -d "${dir}/.git" ] || git -C "$dir" rev-parse --git-dir > /dev/null 2>&1; then
   branch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+  remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null)
+  if echo "$remote_url" | grep -q "github.com"; then
+    github_url=$(echo "$remote_url" \
+      | sed 's|git@github.com:|https://github.com/|' \
+      | sed 's|\.git$||')
+  fi
 fi
 
 # --- usage stats (5h / 7d) from cache ---
@@ -90,6 +97,10 @@ printf "\033[1m\033[38;2;76;208;222m%s\033[22m\033[0m" "$dir_name"
 if [ -n "$branch" ]; then
   printf "%b" "$SEP"
   printf "\033[1m\033[38;2;192;103;222m%s\033[22m\033[0m" "$branch"
+fi
+if [ -n "$github_url" ]; then
+  printf "%b" "$SEP"
+  printf "\033[38;2;156;162;175m%s\033[0m" "$github_url"
 fi
 
 # line 2: usage | ctx
