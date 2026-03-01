@@ -2,7 +2,7 @@
 input=$(cat)
 
 # --- model ---
-model=$(echo "$input" | jq -r '.model.display_name // ""')
+model=$(echo "$input" | jq -r '.model.display_name // ""' | sed 's/^Claude //')
 
 # --- reasoning effort ---
 # models with "1M context" -> "(1M - <effort>)", others -> "(<effort>)"
@@ -47,7 +47,7 @@ fi
 # --- compute_delta: given a raw ISO timestamp, returns human-readable time until reset ---
 compute_delta() {
   clean=$(echo "$1" | sed 's/\.[0-9]*//' | sed 's/[+-][0-9][0-9]:[0-9][0-9]$//' | sed 's/Z$//')
-  reset_epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "$clean" "+%s" 2>/dev/null)
+  reset_epoch=$(TZ=UTC date -d "$clean" "+%s" 2>/dev/null)
   if [ -z "$reset_epoch" ]; then return; fi
   now_epoch=$(date -u "+%s")
   diff=$(( reset_epoch - now_epoch ))

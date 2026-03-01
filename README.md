@@ -39,3 +39,8 @@ The usage cache will otherwise populate automatically on the next tool call or C
 - `jq`
 - `curl`
 - `git` (optional, for branch display)
+
+## Notes
+
+- Scripts use GNU `date` and `stat` (Linux/WSL2). Not compatible with macOS BSD variants.
+- Model name has the `Claude ` prefix stripped (e.g. `Claude Sonnet 4.6` → `Sonnet 4.6`).
