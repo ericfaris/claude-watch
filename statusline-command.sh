@@ -6,12 +6,30 @@ if [ -f /.dockerenv ] || [ -n "$REMOTE_CONTAINERS" ]; then
   in_container="1"
 fi
 
-# --- model ---
-model=$(echo "$input" | jq -r '.model.display_name // ""' | sed 's/^Claude //')
+# --- parse the whole payload in one jq pass ---
+# @sh quotes every value, so eval only ever assigns plain strings. Defaults
+# keep the script rendering if jq is missing or the payload is malformed.
+model="" effort="" dir="" five_h="" seven_d="" five_h_reset="" seven_d_reset=""
+used="" ctx_used="" ctx_total="" cache_warm="" cache_expires=""
+eval "$(printf '%s' "$input" | jq -r '
+  def int: if . == null then "" else floor end;
+  @sh "model=\(.model.display_name // "" | sub("^Claude "; ""))",
+  @sh "effort=\(.effort.level // "")",
+  @sh "dir=\(.workspace.current_dir // .cwd // "")",
+  @sh "five_h=\(.rate_limits.five_hour.used_percentage | if . == null then "" else round end)",
+  @sh "seven_d=\(.rate_limits.seven_day.used_percentage | if . == null then "" else round end)",
+  @sh "five_h_reset=\(.rate_limits.five_hour.resets_at | int)",
+  @sh "seven_d_reset=\(.rate_limits.seven_day.resets_at | int)",
+  @sh "used=\(.context_window.used_percentage | if . == null then "" else round end)",
+  @sh "ctx_used=\(.context_window.current_usage
+      | if . == null then "" else (.cache_read_input_tokens + .cache_creation_input_tokens + .input_tokens + .output_tokens) end)",
+  @sh "ctx_total=\(.context_window.context_window_size | int)",
+  @sh "cache_warm=\(.prompt_cache.warm | if . == null then "" else tostring end)",
+  @sh "cache_expires=\(.prompt_cache.expires_at | int)"
+')"
 
 # --- reasoning effort ---
 # models with "1M context" -> "(1M - <effort>)", others -> "(<effort>)"
-effort=$(echo "$input" | jq -r '.effort.level // ""')
 if [ -n "$effort" ]; then
   case "$model" in
     *"1M context"*)
@@ -24,44 +42,51 @@ if [ -n "$effort" ]; then
 fi
 
 # --- folder ---
-dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
 dir_name=$(basename "$dir")
 
 # --- git branch + remote URL + status glyphs ---
+# One `git status --porcelain=v2 --branch` gives branch, ahead/behind and file
+# states. --no-optional-locks avoids fighting Claude's own git commands for the
+# index lock; the timeout keeps a huge repo from stalling every render.
 branch=""
 github_url=""
 git_glyphs=""
-if [ -d "${dir}/.git" ] || git -C "$dir" rev-parse --git-dir > /dev/null 2>&1; then
-  branch=$(git -C "$dir" symbolic-ref --short HEAD 2>/dev/null || git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+git_timeout=""
+command -v timeout > /dev/null 2>&1 && git_timeout="timeout ${CLAUDE_WATCH_GIT_TIMEOUT:-1}"
+porcelain=$($git_timeout git --no-optional-locks -C "$dir" status --porcelain=v2 --branch 2>/dev/null)
+if [ -n "$porcelain" ]; then
+  staged=0 modified=0 untracked=0 ahead=0 behind=0
+  eval "$(printf '%s\n' "$porcelain" | awk '
+    /^# branch.oid /  { oid = substr($3, 1, 7) }
+    /^# branch.head / { head = $3 }
+    /^# branch.ab /   { ahead = substr($3, 2); behind = substr($4, 2) }
+    /^[12u] /         { if (substr($2, 1, 1) != ".") s++; if (substr($2, 2, 1) != ".") m++ }
+    /^\? /            { u++ }
+    END {
+      if (head == "(detached)") head = oid
+      gsub(/'\''/, "", head)
+      printf "branch='\''%s'\'' staged=%d modified=%d untracked=%d ahead=%d behind=%d\n", head, s, m, u, ahead, behind
+    }')"
   remote_url=$(git -C "$dir" remote get-url origin 2>/dev/null)
-  if echo "$remote_url" | grep -q "github.com"; then
-    github_url=$(echo "$remote_url" \
-      | sed 's|git@github.com:|https://github.com/|' \
-      | sed 's|\.git$||')
-  fi
+  case "$remote_url" in
+    *github.com*)
+      github_url=$(echo "$remote_url" \
+        | sed 's|git@github.com:|https://github.com/|' \
+        | sed 's|\.git$||')
+      ;;
+  esac
 
-  porcelain=$(git -C "$dir" status --porcelain 2>/dev/null)
-  staged=$(printf '%s\n' "$porcelain" | grep -c '^[MADRC]')
-  modified=$(printf '%s\n' "$porcelain" | grep -c '^.[MD]')
-  untracked=$(printf '%s\n' "$porcelain" | grep -c '^??')
-  ahead=$(git -C "$dir" rev-list --count '@{u}..HEAD' 2>/dev/null)
-  behind=$(git -C "$dir" rev-list --count 'HEAD..@{u}' 2>/dev/null)
-
-  [ "$staged" -gt 0 ] 2>/dev/null && git_glyphs="${git_glyphs} +${staged}"
-  [ "$modified" -gt 0 ] 2>/dev/null && git_glyphs="${git_glyphs} ~${modified}"
-  [ "$untracked" -gt 0 ] 2>/dev/null && git_glyphs="${git_glyphs} ?${untracked}"
-  [ -n "$ahead" ] && [ "$ahead" -gt 0 ] 2>/dev/null && git_glyphs="${git_glyphs} \xe2\x86\x91${ahead}"
-  [ -n "$behind" ] && [ "$behind" -gt 0 ] 2>/dev/null && git_glyphs="${git_glyphs} \xe2\x86\x93${behind}"
-  git_glyphs=$(printf '%s' "$git_glyphs" | sed 's/^ *//')
+  [ "$staged" -gt 0 ] && git_glyphs="${git_glyphs} +${staged}"
+  [ "$modified" -gt 0 ] && git_glyphs="${git_glyphs} ~${modified}"
+  [ "$untracked" -gt 0 ] && git_glyphs="${git_glyphs} ?${untracked}"
+  [ "$ahead" -gt 0 ] && git_glyphs="${git_glyphs} \xe2\x86\x91${ahead}"
+  [ "$behind" -gt 0 ] && git_glyphs="${git_glyphs} \xe2\x86\x93${behind}"
+  git_glyphs=${git_glyphs# }
 fi
 
 # --- usage stats (5h / 7d), piped by Claude Code as .rate_limits ---
 # resets_at is epoch seconds. CLAUDE_WATCH_NOW overrides the clock (tests).
 now_epoch=${CLAUDE_WATCH_NOW:-$(date -u "+%s")}
-five_h=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty | round')
-seven_d=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty | round')
-five_h_reset=$(echo "$input" | jq -r '.rate_limits.five_hour.resets_at // empty | floor')
-seven_d_reset=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty | floor')
 
 # --- fmt_duration: seconds -> "2d 3h" / "3h 12m" / "12m" ---
 fmt_duration() {
@@ -73,8 +98,10 @@ fmt_duration() {
     echo "${days}d ${hours}h"
   elif [ "$hours" -gt 0 ]; then
     echo "${hours}h ${minutes}m"
-  else
+  elif [ "$minutes" -gt 0 ]; then
     echo "${minutes}m"
+  else
+    echo "${diff}s"
   fi
 }
 
@@ -100,32 +127,38 @@ burn_eta() {
   [ "$eta" -lt "$remaining" ] && fmt_duration "$eta"
 }
 
-# --- burn-rate color: green/gray under 70%, yellow 70-89%, red 90%+ ---
+# --- burn-rate color: sets $color; gray under 70%, yellow 70-89%, red 90%+ ---
+GRAY="\033[38;2;156;162;175m"
+YELLOW="\033[38;2;229;192;123m"
+RED="\033[38;2;224;108;117m"
 color_for_pct() {
-  pct=$(printf "%.0f" "$1" 2>/dev/null)
-  [ -z "$pct" ] && pct=0
-  if [ "$pct" -ge 90 ]; then
-    echo "\033[38;2;224;108;117m"
-  elif [ "$pct" -ge 70 ]; then
-    echo "\033[38;2;229;192;123m"
+  if [ "$1" -ge 90 ]; then
+    color=$RED
+  elif [ "$1" -ge 70 ]; then
+    color=$YELLOW
   else
-    echo "\033[38;2;156;162;175m"
+    color=$GRAY
   fi
 }
 
 # --- context window ---
-used=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
-ctx_str=""
 ctx_tokens_str=""
-if [ -n "$used" ]; then
-  used_int=$(printf "%.0f" "$used")
-  ctx_str="${used_int}%"
-  ctx_used=$(echo "$input" | jq -r '(.context_window.current_usage.cache_read_input_tokens + .context_window.current_usage.cache_creation_input_tokens + .context_window.current_usage.input_tokens + .context_window.current_usage.output_tokens) // empty' 2>/dev/null)
-  ctx_total=$(echo "$input" | jq -r '.context_window.context_window_size // empty' 2>/dev/null)
-  if [ -n "$ctx_used" ] && [ -n "$ctx_total" ]; then
-    ctx_used_k=$(( ctx_used / 1000 ))
-    ctx_total_k=$(( ctx_total / 1000 ))
-    ctx_tokens_str="${ctx_used_k}k/${ctx_total_k}k"
+if [ -n "$used" ] && [ -n "$ctx_used" ] && [ -n "$ctx_total" ]; then
+  ctx_tokens_str="$(( ctx_used / 1000 ))k/$(( ctx_total / 1000 ))k"
+fi
+
+# --- prompt cache: time until the cache goes cold ---
+# Sending before it expires reuses the cached prefix; after, the whole context
+# is re-read at full price. Yellow in the last minute, red once cold.
+cache_str=""
+if [ -n "$cache_warm" ]; then
+  cache_left=$(( ${cache_expires:-0} - now_epoch ))
+  if [ "$cache_warm" = "true" ] && [ -n "$cache_expires" ] && [ "$cache_left" -gt 0 ]; then
+    cache_str="cache $(fmt_duration "$cache_left")"
+    if [ "$cache_left" -le 60 ]; then cache_color=$YELLOW; else cache_color=$GRAY; fi
+  else
+    cache_str="cache cold"
+    cache_color=$RED
   fi
 fi
 
@@ -139,12 +172,12 @@ if [ -n "$used" ]; then
   else
     ctx_warn=${CLAUDE_WATCH_CTX_WARN:-80}
   fi
-  [ "$used_int" -ge "$ctx_warn" ] 2>/dev/null && compact_soon="1"
+  [ "$used" -ge "$ctx_warn" ] 2>/dev/null && compact_soon="1"
 fi
 
 # --- assemble output ---
 SEP="\033[90m • \033[0m"
-WARN="\033[1m\033[38;2;224;108;117m"
+WARN="\033[1m${RED}"
 
 # line 1: model | folder • branch
 if [ -n "$in_container" ]; then
@@ -169,7 +202,7 @@ fi
 # line 2: usage | ctx
 printf "\n"
 if [ -n "$five_h" ]; then
-  five_h_color=$(color_for_pct "$five_h")
+  color_for_pct "$five_h"; five_h_color=$color
   printf "%b5h %s%%\033[0m" "$five_h_color" "$five_h"
   if [ -n "$five_h_reset" ]; then
     delta=$(compute_delta "$five_h_reset")
@@ -180,7 +213,7 @@ if [ -n "$five_h" ]; then
 fi
 if [ -n "$seven_d" ]; then
   [ -n "$five_h" ] && printf "%b" "$SEP"
-  seven_d_color=$(color_for_pct "$seven_d")
+  color_for_pct "$seven_d"; seven_d_color=$color
   printf "%b7d %s%%\033[0m" "$seven_d_color" "$seven_d"
   if [ -n "$seven_d_reset" ]; then
     delta=$(compute_delta "$seven_d_reset")
@@ -189,10 +222,15 @@ if [ -n "$seven_d" ]; then
   eta=$(burn_eta "$seven_d" "$seven_d_reset" 604800)
   [ -n "$eta" ] && printf " %b\xe2\x9a\xa0 limit in ~%s\033[0m" "$WARN" "$eta"
 fi
-if [ -n "$ctx_str" ]; then
-  ctx_color=$(color_for_pct "$used")
+if [ -n "$used" ]; then
+  color_for_pct "$used"; ctx_color=$color
   printf "\033[90m | \033[0m"
-  printf "%bctx %s\033[0m" "$ctx_color" "$ctx_str"
+  printf "%bctx %s%%\033[0m" "$ctx_color" "$used"
   [ -n "$ctx_tokens_str" ] && printf " \033[2m%b(%s)\033[0m" "$ctx_color" "$ctx_tokens_str"
   [ -n "$compact_soon" ] && printf " %b\xe2\x9a\xa0 compact soon\033[0m" "$WARN"
 fi
+if [ -n "$cache_str" ]; then
+  printf "\033[90m | \033[0m"
+  printf "%b%s\033[0m" "$cache_color" "$cache_str"
+fi
+exit 0

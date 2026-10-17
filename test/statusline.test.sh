@@ -100,6 +100,68 @@ has   "untracked glyph"  "$out" "?1"
 out=$(render "$(fixture 5 9000 5 500000 20)")
 lacks "no branch outside git" "$(printf "%s" "$out" | head -1)" "•"
 
+echo c > "$repo/tracked"; git -C "$repo" add tracked
+git -C "$repo" -c user.email=t@t -c user.name=t commit -q -m tracked
+echo changed > "$repo/tracked"
+out=$(render "$(fixture 5 9000 5 500000 20 "$repo")")
+has "modified glyph" "$out" "~1"
+
+# ahead/behind against an upstream
+git init -q --bare "$TMP/remote.git"
+git -C "$repo" remote add origin "$TMP/remote.git"
+git -C "$repo" push -q -u origin main
+git -C "$repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m ahead1
+git -C "$repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m ahead2
+out=$(render "$(fixture 5 9000 5 500000 20 "$repo")")
+has   "ahead glyph"      "$out" "↑2"
+lacks "no behind glyph"  "$out" "↓"
+git -C "$repo" reset -q --hard HEAD~3
+git -C "$repo" stash -q 2>/dev/null
+out=$(render "$(fixture 5 9000 5 500000 20 "$repo")")
+has   "behind glyph"     "$out" "↓1"
+
+# slash in branch name, then detached HEAD shows the short sha
+git -C "$repo" checkout -q -b feat/x-y
+out=$(render "$(fixture 5 9000 5 500000 20 "$repo")")
+has "branch with slash" "$out" "feat/x-y"
+git -C "$repo" checkout -q --detach
+sha=$(git -C "$repo" rev-parse --short=7 HEAD)
+out=$(render "$(fixture 5 9000 5 500000 20 "$repo")")
+has "detached shows sha" "$out" "• $sha"
+
+# a hung git must not stall the statusline
+mkdir -p "$TMP/slowbin"
+printf '#!/bin/sh\nsleep 5\n' > "$TMP/slowbin/git"; chmod +x "$TMP/slowbin/git"
+start=$(date +%s)
+out=$(render "$(fixture 5 9000 5 500000 20 "$repo")" PATH="$TMP/slowbin:$PATH" CLAUDE_WATCH_GIT_TIMEOUT=1)
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -lt 4 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: slow git stalled render for ${elapsed}s"; fi
+has "slow git still renders usage" "$out" "5h 5%"
+
+# --- prompt cache countdown ---
+cache() { fixture 5 9000 5 500000 20 | jq -c --argjson pc "$1" '. + {prompt_cache: $pc}'; }
+out=$(render "$(cache '{"warm":true,"expires_at":'$((NOW+240))'}')")
+has   "warm cache countdown" "$out" "| cache 4m"
+raw=$(render_raw "$(cache '{"warm":true,"expires_at":'$((NOW+240))'}')")
+has   "warm cache gray"      "$raw" $'\033[38;2;156;162;175mcache 4m'
+raw=$(render_raw "$(cache '{"warm":true,"expires_at":'$((NOW+45))'}')")
+has   "last minute yellow + seconds" "$raw" $'\033[38;2;229;192;123mcache 45s'
+raw=$(render_raw "$(cache '{"warm":false,"expires_at":null}')")
+has   "cold cache red"       "$raw" $'\033[38;2;224;108;117mcache cold'
+out=$(render "$(cache '{"warm":true,"expires_at":'$((NOW-10))'}')")
+has   "expired counts as cold" "$out" "cache cold"
+out=$(render "$(fixture 5 9000 5 500000 20)")
+lacks "no cache segment without data" "$out" "cache"
+
+# --- robustness ---
+printf 'not json' | CLAUDE_WATCH_NOW=$NOW bash "$SCRIPT" > /dev/null 2>&1
+rc=$?; if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: malformed payload exit $rc"; fi
+printf '%s' "$(fixture 5 9000 5 500000 20)" | CLAUDE_WATCH_NOW=$NOW bash "$SCRIPT" > /dev/null
+rc=$?; if [ "$rc" -eq 0 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: calm render exit $rc"; fi
+out=$(render '{"model":{"display_name":"$(touch '"$TMP"'/pwned)"},"workspace":{"current_dir":"'"$TMP/nogit"'"}}')
+if [ -e "$TMP/pwned" ]; then fail=$((fail+1)); echo "FAIL: payload executed as shell"; else pass=$((pass+1)); fi
+has "payload rendered literally" "$out" '$(touch'
+
 # --- container badge ---
 out=$(render "$(fixture 5 9000 5 500000 20)" REMOTE_CONTAINERS=1)
 has "container badge" "$out" "⬢ container"

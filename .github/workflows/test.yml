@@ -1,0 +1,17 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -s sh -S warning statusline-command.sh install.sh
+      - name: statusline tests
+        run: bash test/statusline.test.sh
+      - name: install tests
+        run: bash test/install.test.sh
