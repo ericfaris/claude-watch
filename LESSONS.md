@@ -1,0 +1,3 @@
+# Lessons
+
+- **2026-10-17 — usage data is native now.** Claude Code (≥ ~2.1.x) pipes `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}` (resets_at = epoch *seconds*) to the statusline, plus `refreshInterval` in `statusLine` settings. Dropped `fetch-usage.sh`, its hooks, and the OAuth token scraping. Gotcha: the repo's `fetch-usage.sh` had quietly reverted to the macOS-keychain version (`security`) through a merge, while `~/.claude` held a Linux version — the repo copy never worked on WSL. Check the installed copy against the repo, not just the repo. The payload doesn't include the auto-compact threshold, so the warning uses a configurable heuristic.
