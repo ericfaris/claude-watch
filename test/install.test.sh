@@ -14,6 +14,7 @@ d="$TMP/fresh"
 out=$(install "$d")
 check "script copied"      '[ -x "$d/statusline-command.sh" ]'
 check "script identical"   'cmp -s "$d/statusline-command.sh" "$REPO/statusline-command.sh"'
+check "fetcher copied"     '[ -x "$d/usage-fetch.sh" ] && cmp -s "$d/usage-fetch.sh" "$REPO/usage-fetch.sh"'
 check "settings created"   'jq -e ".statusLine.refreshInterval == 30" "$d/settings.json" > /dev/null'
 check "reports creation"   '[[ "$out" == *"created"* ]]'
 

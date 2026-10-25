@@ -16,9 +16,11 @@ if ! command -v jq > /dev/null 2>&1; then
 fi
 
 mkdir -p "$dest"
-cp "$repo/statusline-command.sh" "$dest/statusline-command.sh"
-chmod +x "$dest/statusline-command.sh"
-echo "installed $dest/statusline-command.sh"
+for f in statusline-command.sh usage-fetch.sh; do
+  cp "$repo/$f" "$dest/$f"
+  chmod +x "$dest/$f"
+  echo "installed $dest/$f"
+done
 
 if [ ! -f "$settings" ]; then
   cp "$repo/settings.json" "$settings"

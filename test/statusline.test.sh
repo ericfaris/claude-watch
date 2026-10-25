@@ -7,11 +7,14 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0
 
+# Never read the real services cache or spawn the real fetcher.
+export CLAUDE_WATCH_CACHE_DIR="$TMP/cache" CLAUDE_WATCH_FETCHER="$TMP/no-fetcher.sh"
+
 # render <json> [env...]: runs the script with a fixed clock, ANSI stripped
 render() {
   json=$1; shift
   printf '%s' "$json" | env -u CLAUDE_AUTOCOMPACT_PCT_OVERRIDE -u CLAUDE_WATCH_CTX_WARN \
-    -u REMOTE_CONTAINERS CLAUDE_WATCH_NOW=$NOW "$@" bash "$SCRIPT" \
+    -u REMOTE_CONTAINERS -u CLAUDE_WATCH_SERVICES CLAUDE_WATCH_NOW=$NOW "$@" bash "$SCRIPT" \
     | sed 's/\x1b\[[0-9;]*m//g'
 }
 render_raw() {
@@ -152,6 +155,60 @@ out=$(render "$(cache '{"warm":true,"expires_at":'$((NOW-10))'}')")
 has   "expired counts as cold" "$out" "cache cold"
 out=$(render "$(fixture 5 9000 5 500000 20)")
 lacks "no cache segment without data" "$out" "cache"
+
+# --- line 3: ideogram / elevenlabs from the services cache ---
+mkdir -p "$TMP/cache"
+services() { printf '%s' "$1" > "$TMP/cache/services.json"; }
+calm=$(fixture 5 9000 5 500000 20)
+services '{"fetched_at":'$NOW',"ideogram":{"credits_left":352,"monthly_credits":2400,"resets_at":'$((NOW+561600))'},
+  "elevenlabs":{"used":12345,"limit":100000,"resets_at":'$((NOW+7200))'}}'
+out=$(render "$calm")
+line3=$(printf '%s\n' "$out" | sed -n 3p)
+has   "ideogram credits"       "$line3" "ideogram 352/2.4k cr (6d 12h)"
+has   "elevenlabs chars"       "$line3" "elevenlabs 12k/100k chars (2h 0m)"
+has   "services separated"     "$line3" "cr (6d 12h) • elevenlabs"
+raw=$(render_raw "$calm")
+has   "ideogram yellow at 85% used" "$raw" $'\033[38;2;229;192;123mideogram 352'
+has   "elevenlabs gray when calm"  "$raw" $'\033[38;2;156;162;175melevenlabs 12k'
+services '{"fetched_at":'$NOW',"ideogram":{"credits_left":-40,"monthly_credits":2400,"resets_at":'$((NOW+60))'},"elevenlabs":{"error":"key needs user_read"}}'
+out=$(render "$calm")
+has   "overdrawn ideogram"     "$out" "ideogram -40/2.4k cr"
+has   "elevenlabs error shown" "$out" "elevenlabs key needs user_read"
+services '{"fetched_at":'$NOW',"ideogram":{"credits_left":-1500,"monthly_credits":2400}}'
+raw=$(render_raw "$calm")
+has   "overdrawn caps red"     "$raw" $'\033[38;2;224;108;117mideogram -1.5k/2.4k cr'
+services '{"fetched_at":'$NOW',"ideogram":{"error":"no ledger"},"elevenlabs":{"error":"no key"}}'
+out=$(render "$calm")
+has   "ideogram error shown"   "$out" "ideogram no ledger"
+out=$(render "$calm" CLAUDE_WATCH_SERVICES=0)
+lacks "services can be disabled" "$out" "ideogram"
+[ "$(printf '%s\n' "$out" | wc -l)" -eq 2 ] && pass=$((pass+1)) || { fail=$((fail+1)); echo "FAIL: disabled services still adds a line"; }
+services 'not json'
+out=$(render "$calm")
+lacks "corrupt cache renders nothing" "$out" "ideogram"
+has   "corrupt cache keeps line 2"    "$out" "5h 5%"
+
+# stale or missing cache spawns the fetcher in the background, fresh doesn't
+fetcher="$TMP/fetcher.sh"
+printf '#!/bin/sh\nsleep 3; touch "%s/fetched"\n' "$TMP" > "$fetcher"
+services '{"fetched_at":'$((NOW-301))'}'
+start=$(date +%s)
+render "$calm" CLAUDE_WATCH_FETCHER="$fetcher" > /dev/null
+elapsed=$(( $(date +%s) - start ))
+if [ "$elapsed" -lt 2 ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: fetch blocked render for ${elapsed}s"; fi
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -e "$TMP/fetched" ] && break; sleep 0.5; done
+if [ -e "$TMP/fetched" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: stale cache didn't run fetcher"; fi
+rm -f "$TMP/fetched"
+printf '#!/bin/sh\ntouch "%s/fetched"\n' "$TMP" > "$fetcher"
+services '{"fetched_at":'$((NOW-10))'}'
+render "$calm" CLAUDE_WATCH_FETCHER="$fetcher" > /dev/null; sleep 0.5
+if [ -e "$TMP/fetched" ]; then fail=$((fail+1)); echo "FAIL: fresh cache ran fetcher"; else pass=$((pass+1)); fi
+rm -f "$TMP/cache/services.json"
+render "$calm" CLAUDE_WATCH_FETCHER="$fetcher" > /dev/null
+for _ in 1 2 3 4 5 6; do [ -e "$TMP/fetched" ] && break; sleep 0.5; done
+if [ -e "$TMP/fetched" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: missing cache didn't run fetcher"; fi
+out=$(render "$calm")
+lacks "no line 3 without cache" "$out" "ideogram"
 
 # --- robustness ---
 printf 'not json' | CLAUDE_WATCH_NOW=$NOW bash "$SCRIPT" > /dev/null 2>&1

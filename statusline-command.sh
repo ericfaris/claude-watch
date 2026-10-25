@@ -162,6 +162,42 @@ if [ -n "$cache_warm" ]; then
   fi
 fi
 
+# --- fmt_k: 12345 -> "12k", 2400 -> "2.4k", 999 -> "999" ---
+fmt_k() {
+  n=${1#-}; sign=${1%"$n"}
+  if [ "$n" -ge 10000 ]; then echo "${sign}$(( n / 1000 ))k"
+  elif [ "$n" -ge 1000 ]; then echo "${sign}$(( n / 1000 )).$(( n % 1000 / 100 ))k"
+  else echo "$1"; fi
+}
+
+# --- ideogram / elevenlabs usage (line 3) ---
+# Read from a cache that usage-fetch.sh refreshes in the background once it's
+# older than CLAUDE_WATCH_SERVICES_TTL (300s), so a render never waits on the
+# network. CLAUDE_WATCH_SERVICES=0 turns the line off.
+ig_left="" ig_total="" ig_reset="" ig_err="" el_used="" el_limit="" el_reset="" el_err=""
+if [ "${CLAUDE_WATCH_SERVICES:-1}" != "0" ]; then
+  services_cache="${CLAUDE_WATCH_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-watch}/services.json"
+  fetched_at=""
+  if [ -f "$services_cache" ]; then
+    eval "$(jq -r '
+      def int: if . == null then "" else floor end;
+      @sh "fetched_at=\(.fetched_at | int)",
+      @sh "ig_left=\(.ideogram.credits_left | int)",
+      @sh "ig_total=\(.ideogram.monthly_credits | int)",
+      @sh "ig_reset=\(.ideogram.resets_at | int)",
+      @sh "ig_err=\(.ideogram.error // "")",
+      @sh "el_used=\(.elevenlabs.used | int)",
+      @sh "el_limit=\(.elevenlabs.limit | int)",
+      @sh "el_reset=\(.elevenlabs.resets_at | int)",
+      @sh "el_err=\(.elevenlabs.error // "")"
+    ' "$services_cache" 2> /dev/null)"
+  fi
+  if [ -z "$fetched_at" ] || [ $(( now_epoch - fetched_at )) -ge "${CLAUDE_WATCH_SERVICES_TTL:-300}" ]; then
+    fetcher=${CLAUDE_WATCH_FETCHER:-$(dirname "$0")/usage-fetch.sh}
+    [ -f "$fetcher" ] && (sh "$fetcher" > /dev/null 2>&1 &)
+  fi
+fi
+
 # --- auto-compact warning ---
 # Claude Code doesn't pipe its compaction threshold, so warn within 5 points of
 # CLAUDE_AUTOCOMPACT_PCT_OVERRIDE when set, else at CLAUDE_WATCH_CTX_WARN (80).
@@ -233,4 +269,32 @@ if [ -n "$cache_str" ]; then
   printf "\033[90m | \033[0m"
   printf "%b%s\033[0m" "$cache_color" "$cache_str"
 fi
+
+# line 3: ideogram credits • elevenlabs characters, colored by share used
+services_line=""
+if [ -n "$ig_left" ] && [ -n "$ig_total" ] && [ "$ig_total" -gt 0 ]; then
+  ig_pct=$(( (ig_total - ig_left) * 100 / ig_total ))
+  [ "$ig_pct" -gt 100 ] && ig_pct=100
+  color_for_pct "$ig_pct"
+  services_line="${color}ideogram $(fmt_k "$ig_left")/$(fmt_k "$ig_total") cr\033[0m"
+  delta=$(compute_delta "$ig_reset")
+  [ -n "$delta" ] && services_line="${services_line} \033[2m${color}(${delta})\033[0m"
+elif [ -n "$ig_err" ]; then
+  services_line="\033[2m${GRAY}ideogram ${ig_err}\033[0m"
+fi
+el_str=""
+if [ -n "$el_used" ] && [ -n "$el_limit" ] && [ "$el_limit" -gt 0 ]; then
+  el_pct=$(( el_used * 100 / el_limit ))
+  color_for_pct "$el_pct"
+  el_str="${color}elevenlabs $(fmt_k "$el_used")/$(fmt_k "$el_limit") chars\033[0m"
+  delta=$(compute_delta "$el_reset")
+  [ -n "$delta" ] && el_str="${el_str} \033[2m${color}(${delta})\033[0m"
+elif [ -n "$el_err" ]; then
+  el_str="\033[2m${GRAY}elevenlabs ${el_err}\033[0m"
+fi
+if [ -n "$el_str" ]; then
+  [ -n "$services_line" ] && services_line="${services_line}${SEP}"
+  services_line="${services_line}${el_str}"
+fi
+[ -n "$services_line" ] && printf "\n%b" "$services_line"
 exit 0
