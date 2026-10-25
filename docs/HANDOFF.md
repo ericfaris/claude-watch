@@ -31,8 +31,8 @@ CI (`.github/workflows/test.yml`) runs all of the above. After changing a script
 ## Config and state outside git
 
 - `~/.config/ideogram/api-key` and `~/.config/elevenlabs/api-key` (mode 600): machine-wide keys.
-  The ElevenLabs key lacks **User: Read**, so line 3 shows `elevenlabs key needs user_read` until
-  that permission is added in the ElevenLabs dashboard.
+  The ElevenLabs key needs **User: Read** (added 2026-10-25), or line 3 shows
+  `elevenlabs key needs user_read`.
 - `~/.local/share/ideogram/{ledger.jsonl,plan.json}`: the shared credit ledger.
   `ideogram-ledger set-left <n>` sets the dashboard balance. The spec is in the README and in
   global `~/.claude/CLAUDE.md` → "Ideogram".
@@ -47,13 +47,12 @@ CI (`.github/workflows/test.yml`) runs all of the above. After changing a script
 
 ## Open items (priority order)
 
-1. Add **User: Read** to the ElevenLabs key (dashboard step for the user).
-2. vandal-preachers still reads `ELEVENLABS_API_KEY` from `deploy/env/{campaign,frostscribe}.env`.
+1. vandal-preachers still reads `ELEVENLABS_API_KEY` from `deploy/env/{campaign,frostscribe}.env`.
    Switch it to a read-only mount of `~/.config/elevenlabs/api-key` plus `*_API_KEY_FILE`.
-3. The hook's price table is an estimate (4.5 low/medium/high = 3/6/10, 22 with images or edits;
+2. The hook's price table is an estimate (4.5 low/medium/high = 3/6/10, 22 with images or edits;
    upscale x2 ≈ 48; Ideogram 3/4 guessed at 3/6/9; video unpriced = 0). Correct drift with
    `set-left`.
-4. The `/v2/account/usage` line-item shape is a guess (`credits`, else `*usd_micros`). Verify it
+3. The `/v2/account/usage` line-item shape is a guess (`credits`, else `*usd_micros`). Verify it
    if the endpoint ever starts returning data.
 
 ## Decisions that may get revisited
