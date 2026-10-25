@@ -8,7 +8,7 @@
 ./install.sh
 ```
 
-Copies `statusline-command.sh` and `usage-fetch.sh` into `~/.claude` (or `$CLAUDE_CONFIG_DIR`) and merges the `statusLine` block from `settings.json` into your `settings.json`, keeping everything else. It's safe to re-run: settings are rewritten only when something changes, with a timestamped backup.
+Copies `statusline-command.sh`, `usage-fetch.sh`, `ideogram-ledger` and `ideogram-hook.sh` into `~/.claude` (or `$CLAUDE_CONFIG_DIR`) and merges the `statusLine` block from `settings.json` into your `settings.json`, keeping everything else. It's safe to re-run: settings are rewritten only when something changes, with a timestamped backup.
 
 **Upgrading from the `fetch-usage.sh` version:** `install.sh` also removes that setup's `PreToolUse`/`Stop` hooks (other hooks are kept). Claude Code now pipes usage itself, so `~/.claude/fetch-usage.sh` and the `/tmp/.claude_usage_cache` / `/tmp/.claude_token_cache` files are no longer used and can be deleted.
 
@@ -24,7 +24,14 @@ Copies `statusline-command.sh` and `usage-fetch.sh` into `~/.claude` (or `$CLAUD
   - **Compaction warning:** `⚠ compact soon` once the context window reaches 80% (`CLAUDE_WATCH_CTX_WARN` to change it), or 5 points under `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` when that's set.
 - **Line 3 — Ideogram credits and ElevenLabs characters:** `ideogram 5/2.4k cr (6d 12h) • elevenlabs 12k/100k chars (5d 3h)`, colored by share used like the usage stats. The statusline only reads a cache (`~/.cache/claude-watch/services.json`); once it's older than `CLAUDE_WATCH_SERVICES_TTL` (300s) it starts `usage-fetch.sh` in the background, so a render never waits on the network. `CLAUDE_WATCH_SERVICES=0` hides the line.
   - **ElevenLabs:** `GET /v1/user/subscription` with the key in `~/.config/elevenlabs/api-key` (or `$ELEVENLABS_API_KEY`). The key needs the **User: Read** (`user_read`) permission; without it the line says `elevenlabs key needs user_read`.
-  - **Ideogram** has no balance endpoint, so credits come from a ledger that the apps spending them keep together. `~/.config/ideogram/plan.json` holds `{"monthly_credits": 2400, "credits_left": 5.2, "credits_set_at": <epoch>}`, where the last two are optional: the balance as last read off the dashboard. `~/.local/share/ideogram/ledger.jsonl` gets one line per billed call, `{"t": <epoch>, "credits": 24, "app": "posterize", "what": "4 versions"}` (or `"usd"` in place of `"credits"`; 1 credit = $0.01). Credits reset on the 1st (local time). Spend counts from the 1st, or from `credits_set_at` if that falls in the current month, and the count takes whichever is higher: the ledger, or Ideogram's `GET /v2/account/usage`. That endpoint has so far returned empty line items, so it's a cross-check, not the source of truth.
+  - **Ideogram** has no balance endpoint, so credits come from one machine-wide ledger that every spender records to (below).
+- **`ideogram-ledger`** — the meter for Ideogram's subscription credits (2400 a month, reset at local midnight on the 1st). Linked into `~/.local/bin`.
+  - `ideogram-ledger set-left 5.2` — the balance the dashboard shows now. Counting restarts from it until the 1st.
+  - `ideogram-ledger add --credits 6 --id <generation_id> --app myapp --what "1 image"` (or `--usd 0.06`, `--estimated`).
+  - `ideogram-ledger status` — `{"credits_left", "monthly_credits", "resets_at", "spent", "since"}`.
+  - Files live in `~/.local/share/ideogram/` (`$IDEOGRAM_LEDGER_DIR`). `ledger.jsonl` holds one `{"v":1,"t","id","credits","estimated","app","what"}` per line, and `plan.json` holds `{"monthly_credits","credits_left","credits_set_at"}`. Writers append a whole line in one write, so no lock is needed; a container mounts the directory read-write and appends directly (posterize, redline). If an `id` repeats, it counts once: the last exact entry, else the last estimate.
+  - The fetcher cross-checks `GET /v2/account/usage` and trusts it when it reports more spend than the ledger. So far it has returned empty line items.
+- **`ideogram-hook.sh`** — a PostToolUse hook on `mcp__ideogram__.*`, registered by `install.sh`. The MCP server bills the same credits but reports no cost, so the hook records an estimate per call from Ideogram's price list (4.5: 3/6/10 credits for low/medium/high, 22 for high with source images or edits; ~48 for an x2 upscale). When `get_generation_status` later shows `usage_cost_usd_micros` (upscales do), the exact cost replaces the estimate. Video isn't priced yet. When estimates drift, correct them with `set-left`.
 - **`settings.json`** — wires up the statusline with `refreshInterval: 30`, so reset countdowns tick while idle.
 
 ## Tests
@@ -32,6 +39,7 @@ Copies `statusline-command.sh` and `usage-fetch.sh` into `~/.claude` (or `$CLAUD
 ```sh
 bash test/statusline.test.sh   # fixture JSON + pinned clock (CLAUDE_WATCH_NOW) -> rendered output
 bash test/usage-fetch.test.sh  # usage-fetch.sh with a fake curl and throwaway ledger/keys
+bash test/ideogram-ledger.test.sh  # ledger math, dedup, concurrency, and the MCP hook
 bash test/install.test.sh      # install.sh against a throwaway CLAUDE_CONFIG_DIR
 ```
 

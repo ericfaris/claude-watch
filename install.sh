@@ -2,8 +2,9 @@
 # Installs the statusline into ~/.claude (or $CLAUDE_CONFIG_DIR) and merges
 # its statusLine block into settings.json. Safe to re-run: settings are only
 # rewritten (with a timestamped backup) when something actually changes.
-# Also strips the PreToolUse/Stop hooks left by the old fetch-usage.sh setup;
-# any other hooks are kept.
+# Registers the PostToolUse hook that meters Ideogram MCP calls, links
+# ideogram-ledger into ~/.local/bin, and strips the PreToolUse/Stop hooks left
+# by the old fetch-usage.sh setup; any other hooks are kept.
 set -e
 
 repo=$(cd "$(dirname "$0")" && pwd)
@@ -16,22 +17,28 @@ if ! command -v jq > /dev/null 2>&1; then
 fi
 
 mkdir -p "$dest"
-for f in statusline-command.sh usage-fetch.sh; do
+for f in statusline-command.sh usage-fetch.sh ideogram-ledger ideogram-hook.sh; do
   cp "$repo/$f" "$dest/$f"
   chmod +x "$dest/$f"
   echo "installed $dest/$f"
 done
 
-if [ ! -f "$settings" ]; then
-  cp "$repo/settings.json" "$settings"
-  echo "created $settings"
-  exit 0
-fi
+bin=${CLAUDE_WATCH_BIN_DIR:-$HOME/.local/bin}
+mkdir -p "$bin"
+ln -sf "$dest/ideogram-ledger" "$bin/ideogram-ledger"
+echo "linked $bin/ideogram-ledger"
+
+hook_cmd="sh $dest/ideogram-hook.sh"
+[ -f "$settings" ] || echo '{}' > "$settings.new"
 
 tmp=$(mktemp "$settings.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
-jq --slurpfile repo "$repo/settings.json" '
+src="$settings"; [ -f "$settings" ] || src="$settings.new"
+jq --slurpfile repo "$repo/settings.json" --arg hook "$hook_cmd" '
   .statusLine = $repo[0].statusLine
+  | .hooks.PostToolUse = ([.hooks.PostToolUse[]? | select(
+        [.hooks[]?.command // "" | contains("ideogram-hook.sh")] | any | not)]
+      + [{matcher: "mcp__ideogram__.*", hooks: [{type: "command", command: $hook, timeout: 10}]}])
   | if .hooks then
       .hooks |= (
         with_entries(.value |= map(select(
@@ -41,9 +48,13 @@ jq --slurpfile repo "$repo/settings.json" '
       )
       | if .hooks == {} then del(.hooks) else . end
     else . end
-' "$settings" > "$tmp"
+' "$src" > "$tmp"
+rm -f "$settings.new"
 
-if jq -e --slurpfile new "$tmp" '. == $new[0]' "$settings" > /dev/null; then
+if [ ! -f "$settings" ]; then
+  mv "$tmp" "$settings"
+  echo "created $settings"
+elif jq -e --slurpfile new "$tmp" '. == $new[0]' "$settings" > /dev/null; then
   echo "$settings already up to date"
 else
   backup="$settings.bak-$(date +%Y%m%d%H%M%S)"

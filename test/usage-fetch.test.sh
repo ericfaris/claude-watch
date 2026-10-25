@@ -31,7 +31,7 @@ fetch() {
   rm -f "$TMP/cache/services.json"
   env -u IDEOGRAM_API_KEY -u ELEVENLABS_API_KEY PATH="$TMP/bin:$PATH" \
     CLAUDE_WATCH_NOW="${at:-$NOW}" CLAUDE_WATCH_CACHE_DIR="$TMP/cache" \
-    CLAUDE_WATCH_IDEOGRAM_LEDGER="$TMP/ledger.jsonl" CLAUDE_WATCH_IDEOGRAM_PLAN="$TMP/plan.json" \
+    IDEOGRAM_LEDGER_DIR="$TMP/ig" \
     CLAUDE_WATCH_IDEOGRAM_KEY_FILE="$TMP/ig.key" CLAUDE_WATCH_ELEVENLABS_KEY_FILE="$TMP/el.key" \
     "$@" sh "$SCRIPT"
   cat "$TMP/cache/services.json" 2> /dev/null
@@ -41,14 +41,18 @@ q() { printf '%s' "$out" | jq -r "$1"; }
 echo '{"buckets":[{"line_items":[]}]}' > "$TMP/ideogram.json"
 echo '{"character_count":12345,"character_limit":100000,"next_character_count_reset_unix":1793000000}' > "$TMP/elevenlabs.json"
 
-# --- no ledger or plan yet ---
+mkdir -p "$TMP/ig"
+
+# --- no ledger or plan yet: the full plan ---
 out=$(fetch)
-check "no ledger error"      '[ "$(q .ideogram.error)" = "no ledger" ]' "$out"
+check "empty ledger is full plan" '[ "$(q .ideogram.credits_left)" = 2400 ]' "$out"
 check "fetched_at written"   '[ "$(q .fetched_at)" = "$NOW" ]'
+out=$(fetch CLAUDE_WATCH_LEDGER_CMD="$TMP/missing")
+check "missing ledger cli"   '[ "$(q .ideogram.error)" = "no ledger" ]' "$out"
 
 # --- counts down from the person's "credits left" anchor ---
-echo '{"monthly_credits":2400,"credits_left":500,"credits_set_at":'$((NOW-1000))'}' > "$TMP/plan.json"
-cat > "$TMP/ledger.jsonl" <<EOF
+echo '{"monthly_credits":2400,"credits_left":500,"credits_set_at":'$((NOW-1000))'}' > "$TMP/ig/plan.json"
+cat > "$TMP/ig/ledger.jsonl" <<EOF
 {"t":$((NOW-2000)),"credits":999,"app":"posterize","what":"before the anchor"}
 {"t":$((NOW-500)),"credits":24,"app":"posterize","what":"4 versions"}
 {"t":$((NOW-100)),"usd":0.06,"app":"redline","what":"usd only"}
@@ -72,11 +76,11 @@ check "api down falls back"  '[ "$(q .ideogram.credits_left)" = 470 ]' "$out"
 
 # --- an anchor from last month is ignored: full plan minus this cycle's spend ---
 echo '{"buckets":[]}' > "$TMP/ideogram.json"
-echo '{"credits_left":10,"credits_set_at":'$(date -d "2026-09-20" +%s)'}' > "$TMP/plan.json"
+echo '{"credits_left":10,"credits_set_at":'$(date -d "2026-09-20" +%s)'}' > "$TMP/ig/plan.json"
 out=$(fetch)
 check "new cycle resets to 2400" '[ "$(q .ideogram.credits_left)" = $((2400-999-24-6)) ]' "$out"
 check "monthly defaults to 2400" '[ "$(q .ideogram.monthly_credits)" = 2400 ]'
-rm "$TMP/plan.json"
+rm "$TMP/ig/plan.json"
 out=$(fetch)
 check "ledger alone works"   '[ "$(q .ideogram.credits_left)" = $((2400-999-24-6)) ]' "$out"
 

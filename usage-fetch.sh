@@ -28,38 +28,17 @@ trap 'rmdir "$lock" 2> /dev/null' EXIT
 
 now=${CLAUDE_WATCH_NOW:-$(date -u "+%s")}
 
-# --- ideogram: shared ledger + plan, cross-checked with /v2/account/usage ---
-# Spend is whichever is higher since the cycle start (or since the person last
-# said how many credits were left): the ledger the apps append to, or the
-# usage API (which has lagged, or come back empty, for subscription credits).
-ig_data=${CLAUDE_WATCH_IDEOGRAM_LEDGER:-${XDG_DATA_HOME:-$HOME/.local/share}/ideogram/ledger.jsonl}
-ig_plan=${CLAUDE_WATCH_IDEOGRAM_PLAN:-$HOME/.config/ideogram/plan.json}
+# --- ideogram: the shared ledger (ideogram-ledger), cross-checked with /v2/account/usage ---
+# If the usage API ever reports more spend since the ledger's start than the
+# ledger has, trust the API for the difference. So far it returns empty line
+# items, so their shape is a best guess: credits, else usd micros.
+ledger_cmd=${CLAUDE_WATCH_LEDGER_CMD:-$(dirname "$0")/ideogram-ledger}
 ig_key=${IDEOGRAM_API_KEY:-$(cat "${CLAUDE_WATCH_IDEOGRAM_KEY_FILE:-$HOME/.config/ideogram/api-key}" 2> /dev/null)}
-
-# local midnight of <yyyy-mm-dd>, GNU or BSD date
-midnight() { date -d "$1 00:00" +%s 2> /dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s 2> /dev/null; }
-
-if [ -f "$ig_plan" ] || [ -f "$ig_data" ]; then
-  # The plan resets to monthly_credits (2400) at local midnight on the 1st.
-  plan=$(jq -c '{monthly_credits: (.monthly_credits // 2400), credits_left, credits_set_at}' "$ig_plan" 2> /dev/null) \
-    || plan='{"monthly_credits":2400}'
-  ym=$(date -d "@$now" +%Y-%m 2> /dev/null || date -r "$now" +%Y-%m)
-  y=${ym%-*}; m=${ym#*-}; m=${m#0}
-  cycle=$(midnight "$ym-01")
-  if [ "$m" -eq 12 ]; then next=$(midnight "$((y + 1))-01-01"); else next=$(midnight "$(printf '%d-%02d-01' "$y" $((m + 1)))"); fi
-
-  # count from the person's "credits left" if they set it this cycle
-  since=$(printf '%s' "$plan" | jq -r --argjson c "$cycle" \
-    'if .credits_left != null and (.credits_set_at // 0) >= $c then .credits_set_at | floor else $c end')
-
-  ledger_spent=$(jq -s --argjson s "$since" \
-    '[.[] | select(.t >= $s) | .credits // ((.usd // 0) * 100)] | add // 0' "$ig_data" 2> /dev/null)
-  ledger_spent=${ledger_spent:-0}
-
-  # line_items have come back empty so far, so their shape is a best guess:
-  # credits if given, else usd micros (1 credit = $0.01).
+status=$(CLAUDE_WATCH_NOW=$now sh "$ledger_cmd" status 2> /dev/null)
+if printf '%s' "$status" | jq -e '.credits_left' > /dev/null 2>&1; then
   api_spent=""
   if [ -n "$ig_key" ]; then
+    since=$(printf '%s' "$status" | jq -r '.since | floor')
     iso=$(date -u -d "@$since" +%Y-%m-%dT%H:%M:%SZ 2> /dev/null || date -u -r "$since" +%Y-%m-%dT%H:%M:%SZ)
     api_spent=$(printf 'Api-Key: %s\n' "$ig_key" | curl -s -m 10 -H @- \
       "${CLAUDE_WATCH_IDEOGRAM_API:-https://api.ideogram.ai}/v2/account/usage?start_time=$iso&bucket_width=1d" 2> /dev/null \
@@ -67,16 +46,12 @@ if [ -f "$ig_plan" ] || [ -f "$ig_data" ]; then
               | .credits // ((.usd_micros // .cost_usd_micros // .usage_cost_usd_micros // 0) / 10000)]
               | add // 0 else empty end' 2> /dev/null)
   fi
-
-  ideogram=$(printf '%s' "$plan" | jq -c --argjson s "$since" --argjson c "$cycle" --argjson n "$next" \
-    --argjson l "$ledger_spent" --argjson a "${api_spent:-null}" '
-    ([$l, ($a // 0)] | max) as $spent
-    | {credits_left: ((if $s > $c then .credits_left else .monthly_credits end) - $spent | round),
-       monthly_credits, resets_at: $n, source: (if $a != null and $a > $l then "api" else "ledger" end)}')
-  [ -n "$ideogram" ] || ideogram='{"error":"bad ledger"}'
-else
-  ideogram='{"error":"no ledger"}'
+  ideogram=$(printf '%s' "$status" | jq -c --argjson a "${api_spent:-null}" '
+    (if $a != null and $a > .spent then $a - .spent else 0 end) as $extra
+    | {credits_left: (.credits_left - $extra), monthly_credits, resets_at,
+       source: (if $extra > 0 then "api" else "ledger" end)}')
 fi
+[ -n "$ideogram" ] || ideogram='{"error":"no ledger"}'
 
 # --- elevenlabs: subscription quota ---
 key=${ELEVENLABS_API_KEY:-$(cat "${CLAUDE_WATCH_ELEVENLABS_KEY_FILE:-$HOME/.config/elevenlabs/api-key}" 2> /dev/null)}

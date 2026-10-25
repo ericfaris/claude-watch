@@ -1,0 +1,89 @@
+#!/bin/sh
+# ideogram-ledger: the one machine-wide meter for Ideogram subscription credits.
+# Ideogram has no balance API, so everything that spends credits records it here:
+#   apps/scripts on the API (exact cost), and the Claude Code hook for MCP calls
+#   (estimates, replaced by the exact cost when one shows up under the same id).
+#
+#   ideogram-ledger add --credits N | --usd X  [--id ID] [--app NAME] [--what TEXT] [--estimated]
+#   ideogram-ledger set-left N      # the balance the dashboard shows right now
+#   ideogram-ledger status          # {"credits_left","monthly_credits","resets_at","spent","since"}
+#
+# Files ($IDEOGRAM_LEDGER_DIR, default ~/.local/share/ideogram):
+#   ledger.jsonl  {"v":1,"t":<epoch>,"id","credits","estimated","app","what"} per line, appended
+#                 with one write (atomic under PIPE_BUF), so writers need no lock.
+#   plan.json     {"monthly_credits":2400,"credits_left","credits_set_at"}
+# The plan resets to monthly_credits at local midnight on the 1st. An entry whose id repeats
+# counts once: the last exact one, else the last estimate.
+
+dir=${IDEOGRAM_LEDGER_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ideogram}
+ledger="$dir/ledger.jsonl"
+plan="$dir/plan.json"
+now=${CLAUDE_WATCH_NOW:-$(date +%s)}
+
+die() { echo "ideogram-ledger: $*" >&2; exit 2; }
+is_num() { printf '%s' "$1" | grep -Eq '^[0-9]+([.][0-9]+)?$'; }
+
+# local midnight of <yyyy-mm-dd>, GNU or BSD date
+midnight() { date -d "$1 00:00" +%s 2> /dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s 2> /dev/null; }
+
+cmd_add() {
+  credits="" usd="" id="" app="" what="" estimated=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --credits) credits=$2; shift 2 ;;
+      --usd) usd=$2; shift 2 ;;
+      --id) id=$2; shift 2 ;;
+      --app) app=$2; shift 2 ;;
+      --what) what=$2; shift 2 ;;
+      --estimated) estimated=true; shift ;;
+      *) die "add: unknown option $1" ;;
+    esac
+  done
+  if [ -n "$usd" ] && [ -z "$credits" ]; then
+    is_num "$usd" || die "add: --usd must be a number"
+    credits=$(jq -n --argjson u "$usd" '$u * 100 | . * 1000 | round / 1000')
+  fi
+  is_num "$credits" || die "add: --credits (or --usd) must be a non-negative number"
+  mkdir -p "$dir" || die "can't create $dir"
+  line=$(jq -cn --argjson t "$now" --arg id "$id" --argjson c "$credits" --argjson e "$estimated" \
+    --arg app "${app:-unknown}" --arg what "$what" \
+    '{v: 1, t: $t, id: (if $id == "" then null else $id end), credits: $c, estimated: $e, app: $app, what: $what}')
+  printf '%s\n' "$line" >> "$ledger"
+}
+
+cmd_set_left() {
+  is_num "$1" || die "set-left: give the credits left as a number"
+  mkdir -p "$dir" || die "can't create $dir"
+  tmp=$(mktemp "$plan.XXXXXX") || exit 1
+  { cat "$plan" 2> /dev/null || echo '{}'; } \
+    | jq --argjson l "$1" --argjson t "$now" '{monthly_credits: (.monthly_credits // 2400)} + . + {credits_left: $l, credits_set_at: $t}' \
+      > "$tmp" && mv "$tmp" "$plan" || { rm -f "$tmp"; die "couldn't write $plan"; }
+}
+
+cmd_status() {
+  ym=$(date -d "@$now" +%Y-%m 2> /dev/null || date -r "$now" +%Y-%m)
+  y=${ym%-*}; m=${ym#*-}; m=${m#0}
+  cycle=$(midnight "$ym-01")
+  if [ "$m" -eq 12 ]; then next=$(midnight "$((y + 1))-01-01"); else next=$(midnight "$(printf '%d-%02d-01' "$y" $((m + 1)))"); fi
+  plan_json=$(jq -c 'if type == "object" then . else {} end' "$plan" 2> /dev/null) || plan_json='{}'
+  # -R + fromjson?: one corrupt line is skipped instead of breaking the whole read
+  { [ -f "$ledger" ] && cat "$ledger"; } | jq -nRc --argjson p "${plan_json:-\{\}}" --argjson c "$cycle" --argjson n "$next" '
+    [inputs | fromjson? | select(type == "object" and (.t | type) == "number")] as $e
+    | $p | (.monthly_credits // 2400) as $monthly
+    | (if .credits_left != null and (.credits_set_at // 0) >= $c then .credits_set_at else $c end) as $since
+    | (if $since > $c then .credits_left else $monthly end) as $base
+    | ($e | (map(select(.id == null)) + (map(select(.id != null)) | group_by(.id)
+              | map((map(select(.estimated != true)) | last) // last)))
+          # the anchor already includes spend up to its own second
+          | map(select(if $since > $c then .t > $since else .t >= $since end)
+                | .credits // ((.usd // 0) * 100)) | add // 0) as $spent
+    | {credits_left: ($base - $spent | . * 10 | round / 10), monthly_credits: $monthly,
+       resets_at: $n, spent: ($spent | . * 10 | round / 10), since: $since}'
+}
+
+case "$1" in
+  add) shift; cmd_add "$@" ;;
+  set-left) cmd_set_left "$2" ;;
+  status) cmd_status ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; [ -z "$1" ] || [ "$1" = -h ] || [ "$1" = --help ] || exit 2 ;;
+esac
